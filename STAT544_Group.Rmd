@@ -109,3 +109,71 @@ filt_clean%>%ggplot(aes(x=factor(INCOME3), fill=factor(`_PHYS14D`)))+geom_bar(po
 filt_clean%>%ggplot(aes(x=factor(PRIMINSR), fill=factor(MEDCOST1)))+geom_bar(position="fill")
 ```
 
+#FEATURES FOR CANCER/HEART DISEASE MODELS
+```{r echo=T}
+vars <- c("_MICHD","CNCRDIFF", "CNCRAGE", "CNCRTYP2","_RFMAM22", "_MAM5023",
+  "_HADCOLN", "_CLNSCP1", "_HADSIGM", "_SGMSCP1", "_SGMS101","_RFBLDS5", 
+  "_STOLDN1", "_VIRCOL1", "_SBONTI1", "_CRCREC2","CVDSTRK3", "COPDCOGH", 
+  "COPDFLEM", "COPDBRTH", "_LTASTH1", "_CASTHM1", "_ASTHMS1", "CIMEMLOS", 
+  "CDHOUSE", "CDASSIST", "CDHELP", "CDSOCIAL", "CDDISCUS", "PDIABTS1", "PREDIAB2",
+  "DIABETE4", "DIABTYPE", "INSULIN1", "CHCKDNY2", "_SMOKER3", "_RFSMOK3", 
+  "_CURECI2", "_YRSSMOK", "_PACKDAY", "_PACKYRS", "_YRSQUIT", "_SMOKGRP", "_LCSREC",
+  "DRNKANY6", "DROCDY4_", "_RFBING6", "_DRNKWK2", "_RFDRHV8", "COVIDPOS", 
+  "COVIDSMP", "COVIDPRM", "_TOTINDA", "SLEPTIM1", "PRIMINSR", "CSRVINSR", 
+  "CSRVDEIN", "_HLTHPLN", "_HCVU652", "MEDCOST1", "CHECKUP1")
+
+
+df <- brfss_ca[, vars]
+#Rename and Recode to 0/1
+# _MICHD: 1 = yes, 2 = no 
+# _TOTINDA: 1 = exercised, 2 = no exercise
+df$mic_hd <- ifelse(df$`_MICHD` == 1, 1, 0)
+df$exercise <- ifelse(df$`_TOTINDA` == 1, 1, 0)
+
+```
+#Heart Model
+```{r echo=T}
+heart_model <- glm(
+  mic_hd ~ exercise + SLEPTIM1 + `_SMOKER3` + `_PACKYRS` + DRNKANY6 + 
+    `_RFBING6` + `_RFDRHV8` + `_HLTHPLN` + MEDCOST1,
+  data = df,
+  family = binomial
+)
+
+summary(heart_model)
+exp(coef(heart_model))
+
+```
+#Sleep
+```{r echo=T}
+dfsleep <- subset(brfss_ca, select = c(`_MICHD`, SLEPTIM1))
+
+# check missing
+colSums(is.na(dfsleep))
+
+# remove NAs
+dfsleep <- na.omit(dfsleep)
+
+# recode heart disease
+dfsleep$mic_hd <- ifelse(dfsleep$`_MICHD` == 1, 1, 0)
+
+# correlation
+cor(dfsleep$mic_hd, dfsleep$SLEPTIM1)
+
+# logistic regression
+sleep_model <- glm(mic_hd ~ SLEPTIM1, data=dfsleep, family=binomial)
+
+summary(sleep_model)
+
+# odds ratio
+exp(coef(sleep_model))
+```
+#bin sleep
+```{r echo=T}
+dfsleep$sleep_bin <- cut(dfsleep$SLEPTIM1, breaks=c(0,5,8,24),
+  labels=c("short","normal","long")
+)
+table <- table(dfsleep$mic_hd, dfsleep$sleep_bin)
+prop.table(table,2)
+chisq.test(table)
+```
