@@ -13,7 +13,11 @@ library(haven)
 library(skimr)
 library(tidyverse)
 library(magrittr)
-brfss_raw <- read_xpt("C:\\Users\\jonah\\Downloads\\LLCP2022XPT\\LLCP2022.XPT")
+library(survey)
+
+#Adjust Address Accordingly
+#brfss_raw <- read_xpt("D:\\Documents\\Notes\\544\\LLCP2022XPT\\LLCP2022.XPT")
+
 brfss_ca<-brfss_raw%>%filter(`_STATE`==6,`_METSTAT`==1)
 brfss_ca%>%skim()
 
@@ -23,10 +27,308 @@ library(PerformanceAnalytics)
 filt=brfss_ca[,c("INCOME3","GENHLTH","_TOTINDA","MEDCOST1",
                  "PRIMINSR","CHECKUP1","_PHYS14D","_IMPRACE",
                  "MARITAL","EDUCA","EMPLOY1","CHILDREN","_HLTHPLN",
-                 "PERSDOC3","_MENT14D")]
-#chart.Correlation(filt, method='pearson')
+                 "PERSDOC3","_MENT14D","_SEX","_HCVU652",
+                 "_DENVST3","FLUSHOT7","PNEUVAC4","_RFMAM22",
+                 "_CLNSCP1","HIVTST7","COVIDVA1","CERVSCRN",
+                 "_RFHLTH","POORHLTH","SLEPTIM1","_MICHD",
+                 "CVDSTRK3","_CASTHM1","CHCCOPD3","ADDEPEV3",
+                 "DIABETE4","PREDIAB2","_DRDXAR2","CHCKDNY2",
+                 "CHCSCNC1","DEAF","BLIND","DECIDE","DIFFWALK",
+                 "DIFFDRES","DIFFALON","_RFSMOK3","_RFBMI5",
+                 "_RFBING6","_RFDRHV8","EMPLOY1","FOODSTMP",
+                 "SDHFOOD1","SDHBILLS","SDHUTILS","SDHTRNSP",
+                 "_EDUCAG","_AGEG5YR","MARITAL")]
+
+filt_US=brfss_raw[,c("INCOME3","GENHLTH","_TOTINDA","MEDCOST1",
+                 "PRIMINSR","CHECKUP1","_PHYS14D","_IMPRACE",
+                 "MARITAL","EDUCA","EMPLOY1","CHILDREN","_HLTHPLN",
+                 "PERSDOC3","_MENT14D","_SEX")]
+
+design <- svydesign(
+  id      = ~`_PSU`,
+  strata  = ~`_STSTR`,
+  weights = ~`_LLCPWT`,
+  data    = brfss_ca,
+  nest    = TRUE
+)
 
 ```
+
+```{r CDC dataset imputation }
+library(tidymodels)
+library(mice)
+library(mitools)
+
+na_if_brfss <- function(x, miss_codes) {
+  x <- as.numeric(x)
+  x[x %in% miss_codes] <- NA
+  x
+}
+
+income_dat <- brfss_ca %>%
+  select(
+    INCOME3,
+    EDUCA,
+    EMPLOY1,
+    `_AGEG5YR`,
+    `_IMPRACE`,
+    MARITAL,
+    SEXVAR,
+    `_HLTHPLN`,
+    GENHLTH,
+    `_SMOKER3`,
+    `_LLCPWT`,
+    `_STSTR`,
+    `_PSU`
+  ) %>%
+  mutate(
+    INCOME3 = na_if_brfss(INCOME3, c(77, 99)),
+    EDUCA = na_if_brfss(EDUCA, c(9)),
+    EMPLOY1 = na_if_brfss(EMPLOY1, c(9)),
+    MARITAL = na_if_brfss(MARITAL, c(9)),
+    GENHLTH = na_if_brfss(GENHLTH, c(7, 9)),
+    `_AGEG5YR` = as.numeric(`_AGEG5YR`),
+    `_IMPRACE` = as.numeric(`_IMPRACE`),
+    SEXVAR = as.numeric(SEXVAR),
+    `_HLTHPLN` = as.numeric(`_HLTHPLN`),
+    `_SMOKER3` = as.numeric(`_SMOKER3`)
+  ) %>%
+  mutate(
+    INCOME3 = factor(INCOME3, ordered = TRUE),
+    EDUCA = factor(EDUCA, ordered = TRUE),
+    EMPLOY1 = factor(EMPLOY1),
+    `_AGEG5YR` = factor(`_AGEG5YR`, ordered = TRUE),
+    `_IMPRACE` = factor(`_IMPRACE`),
+    MARITAL = factor(MARITAL),
+    SEXVAR = factor(SEXVAR),
+    `_HLTHPLN` = factor(`_HLTHPLN`),
+    GENHLTH = factor(GENHLTH, ordered = TRUE),
+    `_SMOKER3` = factor(`_SMOKER3`, ordered = TRUE)
+  ) %>%
+  filter(!(is.na(INCOME3) &
+           is.na(EDUCA) &
+           is.na(EMPLOY1) &
+           is.na(MARITAL) &
+           is.na(GENHLTH) &
+           is.na(`_SMOKER3`)))
+
+md.pattern(income_dat)
+
+meth <- make.method(income_dat)
+meth[] <- ""
+meth["INCOME3"] <- "polyreg"
+
+pred <- make.predictorMatrix(income_dat)
+pred[,] <- 0
+
+pred["INCOME3", c(
+  "EDUCA", "EMPLOY1", "_AGEG5YR", "_IMPRACE", "MARITAL", "SEXVAR",
+  "_HLTHPLN", "GENHLTH", "_SMOKER3", "_LLCPWT"
+)] <- 1
+
+pred["INCOME3", c("_STSTR", "_PSU")] <- 0
+pred["INCOME3", "INCOME3"] <- 0
+
+imp <- mice(
+  income_dat,
+  m = 20,
+  method = meth,
+  predictorMatrix = pred,
+  maxit = 20,
+  seed = 232839,
+  printFlag = FALSE
+)
+
+plot(imp)
+stripplot(imp, INCOME3 ~ .imp)
+
+imp_list <- complete(imp, action = "all")
+
+sapply(imp_list, function(d) sum(is.na(d$INCOME3)))
+
+options(survey.lonely.psu = "adjust")
+
+designs <- lapply(imp_list, function(d) {
+  svydesign(
+    ids = ~`_PSU`,
+    strata = ~`_STSTR`,
+    weights = ~`_LLCPWT`,
+    data = d,
+    nest = TRUE
+  )
+})
+
+fits <- lapply(designs, function(des) {
+  svyolr(
+    INCOME3 ~ EDUCA + EMPLOY1 + `_AGEG5YR` + `_IMPRACE` +
+      GENHLTH + SEXVAR + MARITAL + `_HLTHPLN` + `_SMOKER3`,
+    design = des
+  )
+})
+
+pooled <- MIcombine(
+  results = lapply(fits, coef),
+  variances = lapply(fits, vcov)
+)
+
+summary(pooled)
+
+```
+```{r}
+#Imputed odds ratio
+est <- summary(pooled)
+
+OR <- exp(est$results)
+lower <- exp(est$results - 1.96 * est$se)
+upper <- exp(est$results + 1.96 * est$se)
+
+out <- data.frame(
+  term = rownames(est),
+  estimate = est$results,
+  SE = est$se,
+  OR = OR,
+  CI_lower = lower,
+  CI_upper = upper
+)
+
+out
+
+cc_dat <- income_dat %>%
+  filter(!is.na(INCOME3))
+
+cc_des <- svydesign(
+  ids = ~`_PSU`,
+  strata = ~`_STSTR`,
+  weights = ~`_LLCPWT`,
+  data = cc_dat,
+  nest = TRUE
+)
+
+cc_fit <- svyolr(
+  INCOME3 ~ EDUCA + EMPLOY1 + `_AGEG5YR` + `_IMPRACE` +
+    GENHLTH + SEXVAR + MARITAL + `_HLTHPLN` +
+    `_SMOKER3`,design = cc_des
+)
+
+summary(cc_fit)
+
+
+```
+```{r}
+prop.table(table(income_dat$INCOME3, useNA = "no"))
+
+#One completed dataset
+prop.table(table(imp_list[[1]]$INCOME3))
+
+#Across all completed datasets
+avg_props <- Reduce("+", lapply(imp_list, function(d) prop.table(table(d$INCOME3)))) / length(imp_list)
+avg_props
+
+miss_idx <- is.na(income_dat$INCOME3)
+
+lapply(imp_list, function(d) prop.table(table(d$INCOME3[miss_idx])))
+
+```
+
+```{r Verification, include=FALSE}
+nrow(brfss_ca)
+nrow(income_dat)
+
+sapply(complete(imp, "all"), function(d) sum(is.na(d$INCOME3)))
+```
+
+
+```{r}
+imp_long <- bind_rows(
+  lapply(seq_along(imp_list), function(i) {
+    imp_list[[i]] %>%
+      mutate(.imp = i)
+  }))
+
+income_dist <- imp_long %>%
+  group_by(.imp, INCOME3) %>%
+  summarise(n = n(), .groups = "drop") %>%
+  group_by(.imp) %>%
+  mutate(prop = n / sum(n)) %>%
+  ungroup() %>%
+  group_by(INCOME3) %>%
+  summarise(mean_prop = mean(prop))
+
+ggplot(income_dist, aes(x = INCOME3, y = mean_prop)) +
+  geom_bar(stat = "identity",fill = "orange", alpha = 0.6) +
+  labs(
+    title = "Distribution of Imputed Income",
+    x = "Income",
+    y = "Proportion"
+  )
+```
+
+```{r}
+
+obs_income <- brfss_ca %>%
+  count(INCOME3) %>%
+  mutate(
+    prop = n / sum(n),
+    source = "Observed",
+    INCOME3 = as.character(INCOME3),
+    income_label = case_when(
+      INCOME3 == "1" ~ "<10k",
+      INCOME3 == "2" ~ "10–15k",
+      INCOME3 == "3" ~ "15–20k",
+      INCOME3 == "4" ~ "20–25k",
+      INCOME3 == "5" ~ "25–35k",
+      INCOME3 == "6" ~ "35–50k",
+      INCOME3 == "7" ~ "50–75k",
+      INCOME3 == "8" ~ "75–100k",
+      INCOME3 == "9" ~ "100–150k",
+      INCOME3 == "10" ~ "150–200k",
+      INCOME3 == "11" ~ ">200k",
+      INCOME3 == "77" ~ "Don't know",
+      INCOME3 == "99" ~ "Refused"
+    )
+  )
+
+imp_income <- imp_long %>%
+  filter(!is.na(INCOME3)) %>%
+  mutate(INCOME3 = as.character(INCOME3)) %>%
+  group_by(.imp, INCOME3) %>%
+  summarise(n = n(), .groups = "drop") %>%
+  group_by(.imp) %>%
+  mutate(prop = n / sum(n)) %>%
+  group_by(INCOME3) %>%
+  summarise(prop = mean(prop)) %>%
+  mutate(
+    source = "Imputed",
+    income_label = case_when(
+      INCOME3 == "1" ~ "<10k",
+      INCOME3 == "2" ~ "10–15k",
+      INCOME3 == "3" ~ "15–20k",
+      INCOME3 == "4" ~ "20–25k",
+      INCOME3 == "5" ~ "25–35k",
+      INCOME3 == "6" ~ "35–50k",
+      INCOME3 == "7" ~ "50–75k",
+      INCOME3 == "8" ~ "75–100k",
+      INCOME3 == "9" ~ "100–150k",
+      INCOME3 == "10" ~ "150–200k",
+      INCOME3 == "11" ~ ">200k"
+    )
+  )
+income_compare <- bind_rows(obs_income, imp_income)
+```
+
+```{r}
+ggplot(income_compare, aes(x = income_label, y = prop, fill = source)) +
+  geom_col(position = "dodge") +
+  labs(
+    title = "Income Distribution: Observed vs Imputed",
+    x = "Income Category",
+    y = "Proportion"
+  ) +
+  scale_fill_manual(values = c("Observed" = "steelblue", "Imputed" = "orange")) +
+  theme_minimal() +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1))
+```
+
 ```{r NAs}
 na_summary(filt)
 ```
@@ -37,34 +339,36 @@ filt_clean <- na.omit(filt_numeric)
 filt_clean <- filt_clean[is.finite(rowSums(filt_clean)), ]
 filt_clean <- filt_clean[, apply(filt_clean, 2, var) != 0]
 
-#fviz_nbclust(filt_clean, kmeans,method='wss')
-
+filt_US_num <- filt_US[, sapply(filt_US, is.numeric)]
+filt_US_clean <- na.omit(filt_US_num)
+filt_US_clean <- filt_US_clean[is.finite(rowSums(filt_US_clean)), ]
+filt_US_clean <- filt_US_clean[, apply(filt_US_clean, 2, var) != 0]
 #set.seed(54321)
 #kmen<-kmeans(filt_clean, centers = 3, nstart=20)
 ```
 
 
-```{r}
+```{r, eval=FALSE}
 print(kmen)
 fviz_cluster(kmen, data=filt_clean,geom_point='point', 
              ellipse.type = 'convex',ggtheme=theme_minimal())
 ```
-```{r 3D cluster}
+```{r 3D cluster, eval=FALSE}
 library(plotly)
 pca_data <- prcomp(filt_clean, scale. = TRUE)
 df_pca <- as.data.frame(pca_data$x[, 1:3])
 df_pca$cluster <- as.factor(kmen$cluster)
 ```
 
-```{r Cluster information}
+```{r Cluster information, eval=FALSE}
 table(kmen$cluster)
 filt_clean$cluster <- kmen$cluster
 
 clustered_data <- cbind(filt[rownames(filt_clean), ], cluster = kmen$cluster)
 ```
 
-```{r 3D cluster graph}
-plot_ly(df_pca, 
+```{r 3D cluster graph, eval=FALSE}
+#plot_ly(df_pca, 
         x = ~PC1, y = ~PC2, z = ~PC3, 
         color = ~cluster, 
         colors = "Set1",
@@ -99,81 +403,51 @@ na_summary <- function(data, only_na = FALSE) {
 
 
 ```{r}
-filt_clean%>%ggplot(aes(x=factor(INCOME3), fill=factor(MEDCOST1)))+geom_bar(position="fill")
+filt_clean%>%ggplot(aes(x=factor(INCOME3), fill=factor(MEDCOST1)))+geom_bar(position="fill")+
+  labs(title="California Income Bracket vs Doctor Affordability",
+       x='Income Bracket', fill='Doctor Affordability')
 ```
 ```{r}
-filt_clean%>%ggplot(aes(x=factor(INCOME3), fill=factor(`_PHYS14D`)))+geom_bar(position="fill")
+filt_clean%>%ggplot(aes(x=factor(INCOME3), fill=factor(`_PHYS14D`)))+geom_bar(position="fill")+
+  labs(title="California Income Bracket vs Days in pain",
+       x='Income Bracket', fill='Days in pain')
 ```
 
 ```{r}
-filt_clean%>%ggplot(aes(x=factor(PRIMINSR), fill=factor(MEDCOST1)))+geom_bar(position="fill")
+filt_clean%>%ggplot(aes(x=factor(PRIMINSR), fill=factor(MEDCOST1)))+geom_bar(position="fill")+
+  labs(title="California Insurance Type vs Doctor Affordability",
+       x='Income Bracket', fill='Doctor Affordability')
+```
+```{r}
+filt_US_clean%>%ggplot(aes(x=factor(PRIMINSR), fill=factor(MEDCOST1)))+geom_bar(position="fill")+
+  labs(title="US Insurance Type vs Doctor Affordability",
+       x='Income Bracket', fill='Doctor Affordability')
 ```
 
-#FEATURES FOR CANCER/HEART DISEASE MODELS
-```{r echo=T}
-vars <- c("_MICHD","CNCRDIFF", "CNCRAGE", "CNCRTYP2","_RFMAM22", "_MAM5023",
-  "_HADCOLN", "_CLNSCP1", "_HADSIGM", "_SGMSCP1", "_SGMS101","_RFBLDS5", 
-  "_STOLDN1", "_VIRCOL1", "_SBONTI1", "_CRCREC2","CVDSTRK3", "COPDCOGH", 
-  "COPDFLEM", "COPDBRTH", "_LTASTH1", "_CASTHM1", "_ASTHMS1", "CIMEMLOS", 
-  "CDHOUSE", "CDASSIST", "CDHELP", "CDSOCIAL", "CDDISCUS", "PDIABTS1", "PREDIAB2",
-  "DIABETE4", "DIABTYPE", "INSULIN1", "CHCKDNY2", "_SMOKER3", "_RFSMOK3", 
-  "_CURECI2", "_YRSSMOK", "_PACKDAY", "_PACKYRS", "_YRSQUIT", "_SMOKGRP", "_LCSREC",
-  "DRNKANY6", "DROCDY4_", "_RFBING6", "_DRNKWK2", "_RFDRHV8", "COVIDPOS", 
-  "COVIDSMP", "COVIDPRM", "_TOTINDA", "SLEPTIM1", "PRIMINSR", "CSRVINSR", 
-  "CSRVDEIN", "_HLTHPLN", "_HCVU652", "MEDCOST1", "CHECKUP1")
-
-
-df <- brfss_ca[, vars]
-#Rename and Recode to 0/1
-# _MICHD: 1 = yes, 2 = no 
-# _TOTINDA: 1 = exercised, 2 = no exercise
-df$mic_hd <- ifelse(df$`_MICHD` == 1, 1, 0)
-df$exercise <- ifelse(df$`_TOTINDA` == 1, 1, 0)
-
+```{r}
+filt_US_clean%>%ggplot(aes(x=factor(INCOME3), fill=factor(`_PHYS14D`)))+geom_bar(position="fill")+labs(title="US Income Bracket vs Days in Pain",
+       x='Income Bracket', fill='Days in Pain')
 ```
-#Heart Model
-```{r echo=T}
-heart_model <- glm(
-  mic_hd ~ exercise + SLEPTIM1 + `_SMOKER3` + `_PACKYRS` + DRNKANY6 + 
-    `_RFBING6` + `_RFDRHV8` + `_HLTHPLN` + MEDCOST1,
-  data = df,
-  family = binomial
-)
-
-summary(heart_model)
-exp(coef(heart_model))
-
+```{r}
+filt_clean%>%ggplot(aes(x=factor(`_SEX`), fill=factor(MEDCOST1)))+geom_bar(position="fill")+
+  labs(title="California Gender vs Doctor Affordability",
+       x='Gender', fill='Doctor Affordability')
 ```
-#Sleep
-```{r echo=T}
-dfsleep <- subset(brfss_ca, select = c(`_MICHD`, SLEPTIM1))
 
-# check missing
-colSums(is.na(dfsleep))
-
-# remove NAs
-dfsleep <- na.omit(dfsleep)
-
-# recode heart disease
-dfsleep$mic_hd <- ifelse(dfsleep$`_MICHD` == 1, 1, 0)
-
-# correlation
-cor(dfsleep$mic_hd, dfsleep$SLEPTIM1)
-
-# logistic regression
-sleep_model <- glm(mic_hd ~ SLEPTIM1, data=dfsleep, family=binomial)
-
-summary(sleep_model)
-
-# odds ratio
-exp(coef(sleep_model))
+```{r}
+filt_US_clean%>%ggplot(aes(x=factor(`_SEX`), fill=factor(MEDCOST1)))+geom_bar(position="fill")+
+  labs(title="US Gender vs Doctor Affordability",
+       x='Gender', fill='Doctor Affordability')
 ```
-#bin sleep
-```{r echo=T}
-dfsleep$sleep_bin <- cut(dfsleep$SLEPTIM1, breaks=c(0,5,8,24),
-  labels=c("short","normal","long")
-)
-table <- table(dfsleep$mic_hd, dfsleep$sleep_bin)
-prop.table(table,2)
-chisq.test(table)
+
+```{r}
+filt_US_clean%>%ggplot(aes(x=factor(INCOME3), fill=factor(`_SEX`)))+geom_bar(position="fill")+
+  labs(title="US Income vs Gender",
+       x='Income', fill='Gender')
 ```
+```{r}
+filt_clean%>%ggplot(aes(x=factor(INCOME3), fill=factor(`_SEX`)))+geom_bar(position="fill")+
+  labs(title="California Income vs Gender",
+       x='Income', fill='Gender')
+```
+
